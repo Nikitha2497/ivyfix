@@ -1,0 +1,452 @@
+#lang ivy1.8
+
+include ip
+include tcp_host
+include collections
+include numbers
+include string
+include network
+
+# Types for encoding messages
+
+alias byte = uint[8]
+instance str : string(index,byte)
+
+
+#specification state
+relation seen(S: str)
+var is_logged_in : bool
+
+var global_seq_no : str
+var prev_seq_no : str
+
+after init {
+    debug "init is called";
+    seen(S) := false;
+    is_logged_in := false;
+    global_seq_no := "1";
+    prev_seq_no := "1";
+}
+
+
+<<<header
+    #include <ctime>
+    #include <regex>
+    #include <stdio.h>
+    #include <iostream>
+    #include <string>
+    using namespace std;
+>>>
+
+type logon_t = {request, ack}
+
+# Base class of fix messages
+class msg = {
+
+    #TODO - store session information
+
+    method send   # message observed from client to server
+    method recv  # message observed from server to client
+
+    # field begin_string : str    # represents the fix version
+    # field seq_no : byte         # sequence number of the fix messages
+
+    # Sequence number has to be used only once
+    # before send {
+    #     require ~seen(self.seq_no);
+    # } 
+
+    # after send {
+    #     seen(self.seq_no) := true;
+    # }
+
+    method to_str returns (res:str)  # convert message to string
+}
+
+#Logon fix messages 
+
+subclass logon_msg of msg = {
+    field kind: logon_t
+
+    field begin_string : str    # represents the fix version
+
+    method recv
+    method send
+
+    # Requires the logon message to be the first message.
+    before send {
+        require ~seen(S);
+        require self.kind = request;
+        require ~is_logged_in;
+    }
+
+    after send  {
+        seen(prev_seq_no) := true;
+    }
+
+    # Logon has to be requested only by the initiator
+    before recv {
+        require self.kind = ack;
+    }
+
+    after recv{
+        is_logged_in := true;
+    }
+
+    method to_str returns (res:str) = {
+        var tmp :str;   
+
+        #TODO - In future, take the sender and target compId from a config file 
+
+        #Note - The order of the fields is very important
+        res := "8=FIX.4.49=7335=A";
+        res := res.extend("34=");
+        res := res.extend(global_seq_no);
+        self.update_seq_no();
+        res := res.extend("49=client");
+        res := res.extend("52=");
+        res := res.extend(self.get_timestamp());
+        #TODO - Change the encryption level in future
+        res := res.extend("56=server98=0108=30141=Y");
+        tmp := self.get_checksum(res);
+        res := res.extend("10=");
+        res := res.extend(tmp);
+        res := res.extend("");
+
+    }
+
+    #gets the current timestamp 
+    method get_timestamp returns(res:str) = {
+        <<<
+        time_t t; 
+        struct tm * tt; 
+        time (&t);
+        tt = gmtime(&t);
+        char t_str[100];
+        strftime(t_str, 100, "%Y%m%d-%H:%M:%S.360", tt );
+        std:string tmp(t_str);
+        res.resize(tmp.size());
+        std::copy(tmp.begin(),tmp.end(),res.begin());
+        >>>
+    }
+
+    #Calculates the checksum of the fix message
+    method get_checksum(fix_str:str) returns(res:str) = {
+        <<<
+        std::string tmp;
+        tmp.resize(fix_str.size());
+        std::copy(fix_str.begin(),fix_str.end(),tmp.begin());
+        std::string checksum;
+        checksum.resize(5);
+        long idx;
+        unsigned int cks;
+
+        for( idx = 0L, cks = 0; idx < fix_str.size(); idx++ ){
+            unsigned int val =  (unsigned int)tmp[ idx ];
+                cks += val;
+        }
+        checksum = std::to_string((unsigned int)( cks % 256 ));
+        res.resize(checksum.size());
+        std::copy(checksum.begin(),checksum.end(),res.begin());
+        >>>
+    }
+
+    #Updates the sequence number
+    method update_seq_no = {
+        <<<
+        std::string tmp;
+        tmp.resize(global_seq_no.size());
+        std::copy(global_seq_no.begin(),global_seq_no.end(),tmp.begin());
+        prev_seq_no.resize(tmp.size());
+        std::copy(tmp.begin(), tmp.end(), prev_seq_no.begin());
+        int num = stoi(tmp);
+        num = num + 1;
+        std::string s = std::to_string(num);
+        global_seq_no.resize(s.size());
+        std::copy(s.begin(),s.end(),global_seq_no.begin());
+        std::cout << "An update is made to global seq no " << global_seq_no << endl;
+        >>>   
+    }
+
+}
+
+
+#New fix order message
+subclass new_order of msg = {
+    field begin_string : str    # represents the fix version
+
+    method recv
+    method send
+
+    before send{
+        require ~seen(global_seq_no);
+        require is_logged_in;
+    }
+
+    after send{
+        seen(prev_seq_no) := true;
+    }
+
+    # New single order has to be sent only by the initiator
+    before recv {
+       require false;
+    }
+
+    method to_str returns (res:str) = {
+        res := "35:8^34:";
+        res := res.extend(global_seq_no);
+        self.update_seq_no();
+    }
+
+    method update_seq_no = {
+        <<<
+        std::string tmp;
+        tmp.resize(global_seq_no.size());
+        std::copy(global_seq_no.begin(),global_seq_no.end(),tmp.begin());
+        prev_seq_no.resize(tmp.size());
+        std::copy(tmp.begin(), tmp.end(), prev_seq_no.begin());
+        int num = stoi(tmp);
+        num = num + 1;
+        std::string s = std::to_string(num);
+        global_seq_no.resize(s.size());
+        std::copy(s.begin(),s.end(),global_seq_no.begin());
+        std::cout << "An update is made to global seq no " << global_seq_no << endl;
+        >>>   
+    }
+}
+
+
+#Heartbeart message
+subclass heartbeat_msg of msg = {
+    field begin_string : str    # represents the fix version
+
+    method recv
+    method send
+
+    before send{
+        require ~seen(global_seq_no);
+        require is_logged_in;
+        #debug  "I am here";
+    }
+
+    after send{
+        seen(prev_seq_no) := true;
+    }
+
+    method to_str returns (res:str) = {
+        var tmp :str; 
+        
+        res := "8=FIX.4.435=034=";
+        res := res.extend(global_seq_no);
+        self.update_seq_no();
+        res := res.extend("49=client");
+        res := res.extend("52=");
+        res := res.extend(self.get_timestamp());
+        #TODO - Change the encryption level in future
+        res := res.extend("56=server");
+        #(8=FIX.4.4 9=55 35=0 34=5 49=client 52=20220427-19:34:03.471 56=server10=243)
+        tmp := self.get_checksum(res);
+        res := res.extend("10=");
+        res := res.extend(tmp);
+        res := res.extend("");
+    }
+
+    method get_timestamp returns(res:str) = {
+        <<<
+        time_t t; 
+        struct tm * tt; 
+        time (&t);
+        tt = gmtime(&t);
+        char t_str[100];
+        strftime(t_str, 100, "%Y%m%d-%H:%M:%S.360", tt );
+        std:string tmp(t_str);
+        res.resize(tmp.size());
+        std::copy(tmp.begin(),tmp.end(),res.begin());
+        >>>
+    }
+
+    method get_checksum(fix_str:str) returns(res:str) = {
+        <<<
+        std::string tmp;
+        tmp.resize(fix_str.size());
+        std::copy(fix_str.begin(),fix_str.end(),tmp.begin());
+        std::string checksum;
+        checksum.resize(5);
+        long idx;
+        unsigned int cks;
+
+        for( idx = 0L, cks = 0; idx < fix_str.size(); idx++ ){
+            unsigned int val =  (unsigned int)tmp[ idx ];
+                cks += val;
+        }
+        checksum = std::to_string((unsigned int)( cks % 256 ));
+        res.resize(checksum.size());
+        std::copy(checksum.begin(),checksum.end(),res.begin());
+        >>>
+    }
+
+     method update_seq_no = {
+        <<<
+        std::string tmp;
+        tmp.resize(global_seq_no.size());
+        std::copy(global_seq_no.begin(),global_seq_no.end(),tmp.begin());
+        prev_seq_no.resize(tmp.size());
+        std::copy(tmp.begin(), tmp.end(), prev_seq_no.begin());
+        int num = stoi(tmp);
+        num = num + 1;
+        std::string s = std::to_string(num);
+        global_seq_no.resize(s.size());
+        std::copy(s.begin(),s.end(),global_seq_no.begin());
+        std::cout << "An update is made to global seq no " << global_seq_no << endl;
+        >>>  
+    }
+
+}
+
+module msg_reader(intf,recv) = {
+
+    var buffer : str
+    
+    implement intf.recv(s : intf.socket, inp : str)  {
+        debug "recv" with sock = s, inp = inp, global_seq_no = global_seq_no;
+        decode(inp);
+    }
+
+    #This should be changed to method?
+    action get_msg_type(inp: str) returns(res: str) = {
+        <<<
+        std::string tmp;
+        tmp.resize(inp.size());
+        std::copy(inp.begin(),inp.end(),tmp.begin());
+
+        std::regex r(".*35=(\\w+)*");
+
+        std::smatch m;
+        std::regex_search(tmp, m, r);
+
+        for(string v: m){
+            std::cout << v << std::endl;
+            if(v.size() == 1){
+                res.resize(v.size());
+                std::copy(v.begin(), v.end(), res.begin());    
+            }
+            
+        }
+        >>>
+    }
+
+    action decode(inp : str) = {
+        var msg_type: str;
+        msg_type := get_msg_type(inp);
+
+        if msg_type = "A"{
+            #logon accepted
+            debug "logon accepted" with msg_type=msg_type, global_seq_no = global_seq_no;
+            var m: logon_msg;
+            m.kind := ack;
+
+            recv(m);
+            debug "I successfully completed the logon";
+        }
+        else if msg_type = "0"{
+            #heartbeat messages
+            debug "heart beat message" with msg_type=msg_type, global_seq_no = global_seq_no;
+            var m: heartbeat_msg;
+            m.send;
+        }
+        else if msg_type = "8"{
+            debug "new single" with msg_type=msg_type;
+
+        }
+        else if msg_type = "5"{
+            debug "logout message" with msg_type=msg_type;
+            #logout message
+        }
+        else{
+            #Any other message types which are not supported yet.
+            debug "this msg type is not supported yet" with msg_type=msg_type;
+        }
+        # var is_tag :=  true;
+        # var is_field := false;
+        # var tag: str;
+        # var f: str;
+
+        # debug "recevied this message from acceptor" with input=inp;
+        # for idx, b in inp{
+        #     if b = 58{ #Ascii for :
+        #         is_field := true;
+        #         is_tag := false;
+        #     }
+        #     else if b = 94{ #Ascii for ^
+        #         if tag = "35" & f = "A" {
+        #             var m : logon_msg;
+        #             m.kind := ack;
+        #             recv(m);
+        #         }
+        #         is_field := false;
+        #         is_tag := true;
+        #     }
+        #     else{
+        #         if is_tag{
+        #             tag := tag.append(b);
+        #         }
+        #         else if is_field{
+        #             f := f.append(b);
+        #         }
+        #     }
+        # }
+    }
+
+
+    
+}
+
+# This module encodes messages and sends them on a stream interface.
+
+module msg_writer(intf) = {
+
+    #var buffer : str
+    
+    action write(s : intf.socket, inp : msg) = {
+        var ok := intf.send(s,inp.to_str);
+    }
+}
+
+instance tcp_intf : tcp_host(ip.endpoint,str)
+
+var tcp_sock : tcp_intf.socket
+
+parameter server_addr : ip.endpoint
+
+after init {
+    tcp_sock := tcp_intf.connect(server_addr);
+}
+
+instance reader : msg_reader(tcp_intf,handle_msg)
+instance writer : msg_writer(tcp_intf)
+
+action handle_msg(m : msg) = {
+   m.recv;
+}
+
+export logon_msg.send
+#export new_order.send
+#export heartbeat_msg.send
+
+
+
+implement logon_msg.send(self:logon_msg) {
+    writer.write(tcp_sock,self);
+}
+
+implement new_order.send(self:new_order) {
+    writer.write(tcp_sock,self);
+}
+
+implement heartbeat_msg.send(self:heartbeat_msg) {
+    writer.write(tcp_sock, self);
+}
+
+
+
+
